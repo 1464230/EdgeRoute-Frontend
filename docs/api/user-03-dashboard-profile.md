@@ -1,0 +1,35 @@
+# 仪表盘与个人资料(用户端)
+
+> 路由总数 12,来源 EdgeUserPortal/internal/web/server.go
+
+通用约定:错误统一为 `{"error":"消息"}`;JSON 请求体不允许未知字段,上限 64KB;写操作在 JSON 请求体中携带 `csrfToken`(身份材料上传例外,使用请求头 `X-CSRF-Token`)。`sensitiveUserWrite` 拒绝管理员协助会话、授权失效只读模式,并记录通用操作审计。实名认证相关接口统一受 `identityEnabled` 守卫:后台未开启实名返回 404「实名认证功能未开启」,配置读取失败返回 503「实名认证配置暂时不可用」。
+
+| 接口名称 | 方法 | 路径 | 主要请求参数 | 返回数据结构 | 功能说明 | 认证 |
+|---|---|---|---|---|---|---|
+| 仪表盘 | GET | `/api/dashboard` | 无 | 200:<br>`user` 见「公共结构 apiUser」<br>`dashboard` 见「公共结构 Dashboard」<br>`currentDay` string,当天 `YYYYMMDD`<br>`accounting` 流量口径说明对象:`version`、`source`(`customer_connection`)、`scope`(`account`)、`timezone`、`utcOffsetSeconds`、`originTrafficMeasured`、`internalTrafficMeasured`、`managementTrafficMeasured`<br>错误:401;502 读取用户信息失败/读取统计数据失败 | 返回账户总览与流量/带宽统计(连接字节口径,含传输开销)。 | 需登录 |
+| 个人资料 | GET | `/api/profile` | 无 | 200:<br>`user` 见 apiUser<br>`emailVerificationRequired` bool 后台开启邮箱验证且当前邮箱未验证<br>`passwordLocked` bool 密码是否被锁定(不可改)<br>错误:401;502 读取个人资料失败/读取邮箱验证设置失败 | 返回当前用户资料与邮箱验证、密码锁定状态。 | 需登录 |
+| 实名认证详情 | GET | `/api/identity` | 查询参数:`orgType` string 可选,默认 `individual`(取值 `individual`/`enterprise`,处理函数未校验) | 200:`identity` 为 null 或 UserIdentity 对象:<br>`id` int64<br>`orgType` string<br>`type` string(`idCard`/`enterpriseLicense`)<br>`realName` string<br>`number` string 证件号<br>`fileIds` int64[] 材料文件 ID<br>`status` string(常量:`none`/`rejected`/`verified`)<br>`createdAt`/`updatedAt`/`submittedAt`/`rejectedAt`/`verifiedAt` int64<br>`rejectReason` string<br>(字段均带 omitempty,零值不返回)<br>错误:401;404 实名认证功能未开启;501 实名认证服务不可用;502 读取实名认证失败;503 | 查询指定主体类型下的实名认证记录。 | 需登录(且后台启用实名) |
+| 上传实名材料 | POST | `/api/identity/materials` | 请求头:`X-CSRF-Token` 必填(取自会话 `csrfToken`)<br>`Content-Type: multipart/form-data`,仅一个表单字段 `file`(图片文件):JPG 或 PNG,≤5MB,像素≤4000 万,必须可完整解码 | 201:`fileId` int64 材料文件 ID(`Cache-Control: no-store`)<br>错误:400 请选择材料图片/图片大小必须在 5 MB 以内/每次只能上传一张图片/请上传有效的 JPG 或 PNG 图片/图片内容不完整;403 请求验证失败,请刷新页面后重试;404;429 材料上传过于频繁(按用户限流);502 材料上传失败;503 材料上传暂不可用 | 上传单张身份证明材料,返回的 `fileId` 用于创建/更新实名认证的 `fileIds`。 | 需登录 + CSRF 写保护(CSRF 走请求头) |
+| 创建实名认证 | POST | `/api/identity` | JSON 体:<br>`orgType` string 主体类型 `individual`/`enterprise`(去空格后传给后端)<br>`type` string 证件类型 `idCard`/`enterpriseLicense`<br>`realName` string 真实姓名/企业名称<br>`number` string 证件号<br>`fileIds` int64[] 材料文件 ID(来自上传接口)<br>`csrfToken` string 必填<br>字段必填性与格式校验在后端 RPC,待确认 | 201:`id` int64 新建记录 ID<br>错误:400 请求格式无效/后端校验错误(直接透出错误文本);403 CSRF 校验失败;404;501 | 创建实名认证草稿,之后需调用 submit 提交审核。 | 需登录 + CSRF 写保护 |
+| 更新实名认证 | PATCH | `/api/identity/{identityID}` | 路径参数:`identityID` int64<br>JSON 体:`type`、`realName`、`number`、`fileIds`、`csrfToken` 同创建(此时忽略 `orgType`) | 200:`ok` bool(true)<br>错误:400/403/404/501 同创建 | 更新已有认证记录。`identityID` 非正整数时返回 400 `实名记录编号无效`,不会再落入创建分支(提交 eaa88f1 前会误新建记录,已修复)。 | 需登录 + CSRF 写保护 |
+| 提交实名认证审核 | POST | `/api/identity/{identityID}/submit` | 路径参数:`identityID` int64,必须 >0<br>JSON 体:`csrfToken` string 必填 | 200:`ok` bool(true)<br>错误:400 `实名记录编号无效` 或后端业务错误(透出文本);403 CSRF 校验失败(请求体格式错误同样返回 403);404;501 | 将认证记录提交审核。 | 需登录 + CSRF 写保护 |
+| 更新个人资料 | PUT | `/api/profile` | JSON 体:<br>`fullname` string,去空格后 ≤200 字节<br>`company` string,≤200 个字符<br>`mobile` string,≤50 且仅含 `0-9+(). -`,可为空<br>`csrfToken` string 必填<br>邮箱不可通过本接口修改,沿用账户现有邮箱 | 200:同 `GET /api/profile`(`user`、`emailVerificationRequired`、`passwordLocked`)<br>错误:400 名称/公司名称不能超过 200 个字符、手机号码格式无效、电子邮箱为必填项/邮箱格式无效;403;409 该电子邮箱已被其他账号使用;502 | 修改姓名、公司、手机号,返回更新后的资料。 | 需登录 + CSRF 写保护 |
+| 修改密码 | PUT | `/api/profile/password` | JSON 体:<br>`currentPassword` string 必填<br>`newPassword` string 必填,8-128 位且含大小写字母、数字、符号,且不得与当前密码相同<br>`csrfToken` string 必填 | 200:SessionResponse(同 `GET /api/session`,下发新会话 Cookie)<br>错误:400 当前密码不能为空,新密码长度必须为 8-128 个字符/新密码不能与当前密码相同/当前密码错误或新密码不符合要求;403 CSRF 校验失败/密码被锁定;500 更新登录会话失败;502 读取账号信息失败 | 风险操作:需验证当前密码。成功后轮换当前会话,并使该用户其他会话全部失效。 | 需登录 + CSRF 写保护 |
+| 安全防护概览 | GET | `/api/security-overview` | 无 | 200:<br>`sites` array,元素:`id` string 站点引用、`name`、`domain` string、`wafEnabled` bool、`status` string(`available`/`unavailable`)、`todayBlocks` int64 今日拦截、`todayCaptcha` int64 今日验证码挑战、`todayObserved` int64 今日观察/日志数<br>`total` int 站点总数<br>`truncated` bool 超过 50 个站点被截断<br>按 `todayBlocks` 降序、同数按名称排序<br>错误:401;502 读取网站列表失败 | 汇总用户 HTTP 站点(不含四层)的今日 WAF 数据,最多统计前 50 个站点(按名称排序后截取),单站失败时该站 `status` 为 `unavailable`。 | 需登录 |
+| 安全防护态势 | GET | `/api/security-posture` | 查询参数:<br>`range` string 可选,`24h`(默认)或 `7d`<br>`site` string 可选,站点引用(公开站点 ID),用于只看单个站点 | 200:<br>`from` / `to` string RFC3339(UTC)<br>`range` string<br>`sampled` bool 数据是否被采样/截断<br>`totalSites` int<br>`sites` array:`id`、`name`、`domain`、`wafEnabled`、`status`、`blocked`、`challenges`、`observed`(int64)<br>`blocked` / `challenges` / `observed` int64 总计<br>`categories` / `regions` / `countries` / `sources` array,元素 `name` string、`count` int、`countryCode` string(可选)<br>`events` array(最多 100 条,按时间倒序),元素:`id`、`siteId`、`siteName`、`timestamp` int64、`host`、`path`、`method`、`status` int32、`action`、`clientIP`、`category`、`region`、`countryCode`、`edgeTarget`(`regionId`、`regionName`、`countryCode`、`countryName`、`latitude`、`longitude` 等,完整字段待确认)<br>`timeline` array:`label` string、`blocked`、`challenges`、`observed` int64<br>错误:400 时间范围仅支持 24h 或 7d;401;403 当前套餐未开通网站防护态势功能(需套餐含查看访问日志功能 `UserFeatureCodeServerViewAccessLog`);404 网站不存在;502 读取网站列表失败 | 汇总用户站点近 24 小时/7 天的安全事件态势;最多统计前 50 个站点,超出或单站失败时 `sampled=true`。 | 需登录(另需套餐功能:查看访问日志) |
+| 聚合统计 | GET | `/api/statistics` | 查询参数(二选一):<br>`from` + `to` string 自定义日期,格式 `YYYY-MM-DD` 或 `YYYYMMDD`,必须同时提供,from≤to,跨度≤100 天<br>`days` int 预设天数,默认 30,范围 1-100 | 200:<br>`currentDay` string `YYYYMMDD`<br>`accounting` 口径对象(`source=business_response`,`scope=websites`,其余字段同仪表盘 accounting)<br>`traffic`:`days` int,`stats` array 按天合并,元素:`day`、`bytes`、`cachedBytes`、`uncachedBytes`、`countRequests`、`countCachedRequests`、`countAttackRequests`、`attackBytes`、`countIPs`(int64;`timeFrom`/`timeTo`/`timeAt` 在日汇总行中被清空)<br>`bandwidth`:`days` int,`stats` array(`day`、`timeAt`、`bytes`、`bits`),`aggregation` 固定 `coincident_window_peak_upper_bound`<br>`waf`:`countDailyLog`、`countDailyBlock`、`countDailyCaptcha`、`countWeeklyBlock`、`countMonthlyBlock`(int64),`logDailyStats`/`blockDailyStats`/`captchaDailyStats` array(`day` string、`count` int64,覆盖区间内每一天)<br>错误:400 统计日期范围无效;401;502 读取站点失败/读取站点统计失败(任一站点失败即整体失败) | 汇总用户全部 HTTP 站点(不含四层转发)的流量、带宽、WAF 统计。最多 8 个站点并发拉取;带宽峰值为各站点同窗口峰值之和的上界。 | 需登录 |
+
+## 公共结构
+
+### apiUser
+`id` int64、`username` string、`fullname` string(可省略)、`company` string(可省略)、`mobile` string(可省略)、`email` string(可省略)、`verifiedEmail` string(可省略)、`emailVerified` bool(邮箱非空且等于已验证邮箱)、`nodeCluster` 对象 `{id int64, name string}`(可省略)。
+
+### Dashboard
+`GET /api/dashboard` 中的 `dashboard` 直接序列化后端 protobuf `ComposeUserDashboardResponse`,字段带 omitempty(零值不返回):
+- `countServers` int64 站点数
+- `monthlyTrafficBytes` / `monthlyPeekBandwidthBytes` int64 本月流量/峰值带宽
+- `dailyTrafficBytes` / `dailyPeekBandwidthBytes` int64 今日流量/峰值带宽
+- `dailyTrafficStats` array:`day`、`bytes`、`cachedBytes`、`attackBytes`、`countRequests`、`countCachedRequests`、`countAttackRequests`、`countIPs`
+- `dailyPeekBandwidthStats` array:`day`、`bytes`
+- `bandwidthPercentile` int32 带宽百分位、`bandwidthPercentileBits` int64
+- `dailyCountIPs` int64

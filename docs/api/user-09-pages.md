@@ -1,0 +1,61 @@
+# 静态网站 Pages(用户端)
+> 路由总数 22,来源 EdgeUserPortal/internal/web/server.go
+
+说明:
+- 所有错误统一返回 `{"error":"消息"}`;未登录统一 401 `请先登录`。
+- 路径参数 `{siteID}` 不是数据库自增ID,而是服务端生成的公开引用串(前缀 + HMAC-SHA256 后 base32 小写,由 `POST /api/pages` 与列表/详情的 `id` 返回)。引用串无效或不属于当前用户的静态站点,统一 404 `资源不存在`;服务端先拉取用户全部站点再比对,上游失败 502 `读取资源失败`。
+- "需登录+CSRF写保护" = 路由包了 `sensitiveUserWrite`(管理员协助会话 403 `管理员协助会话不能修改用户资源或安全配置`;平台授权失效 403 只读提示),且处理函数内再用 `validCSRF` 校验 `csrfToken`(不匹配 403 `CSRF 校验失败`)。文件上传例外:CSRF 令牌放在请求头 `X-CSRF-Token`。
+- 请求体使用 `decodeAPIJSON`/`decodeAPIJSONLimit`:禁止未知字段、只允许单个 JSON 对象,默认上限 64KiB;格式错误/超限 400 `请求格式无效`。
+- "CSRF体" 见"公共结构"。
+
+| 接口名称 | 方法 | 路径 | 主要请求参数 | 返回数据结构 | 功能说明 | 认证 |
+|---|---|---|---|---|---|---|
+| 静态网站列表 | GET | `/api/pages` | 无 | 200:<br>`config` PagesConfig<br>`sites` PageSite[]<br>`requirePlan` bool(用户站点策略是否要求套餐)<br>错误:502 `读取静态站点配置失败`/`读取用户站点策略失败`/`读取静态站点失败` | 返回静态站点服务配置与用户全部 Pages 站点(仅 `Type=pages` 的站点)。 | 需登录 |
+| 创建静态网站 | POST | `/api/pages` | JSON 请求体(上限32KiB):<br>`csrfToken` string 必填<br>`domains` string[] 必填,1~20个,小写去重,支持 `*.` 前缀通配,不能是平台保留域名<br>`userPlanId` int64 ≥0,0 表示不绑定套餐 | 201:`{"id": string}`(站点公开引用)<br>错误:400 `套餐 ID 无效`/`至少需要一个域名`/`域名不能超过 20 个`/`域名 "…" 格式无效`/`域名 "…" 是平台保留域名,不能绑定到客户站点`;403;409 `静态站点服务尚未由管理员启用`;502 `创建静态站点失败` | 新建 Pages 站点并绑定访问域名;管理员未启用 Pages 或未配置存储时返回 409。 | 需实名(`requireIdentity`)+需登录+CSRF写保护 |
+| 静态网站详情 | GET | `/api/pages/{siteID}` | 路径参数:`siteID` string 公开引用 | 200:<br>`site` PageSite<br>`pages` ServerPages {`isOn` bool,`createdAt` int64,`storageLimitMB` int64}<br>`config` PagesConfig<br>`dns` PagesDNS(DNS 解析自检结果)<br>错误:404 `资源不存在`/`静态站点不存在`;502 `读取静态站点存储失败`/`读取静态站点配置失败`/`读取静态站点失败` | 并发读取存储、配置并做域名 DNS 自检(单次最长 4 秒);`storageLimitMB` 取站点桶容量,为 0 时回落到全局每站点存储上限。 | 需登录 |
+| 修改静态网站 | PATCH | `/api/pages/{siteID}` | 路径参数:`siteID`<br>JSON 请求体(上限32KiB):<br>`csrfToken` string 必填<br>`name` string 可选,去空白后 1~128 字节<br>`domains` string[] 可选,规则同创建<br>`isOn` bool 可选<br>(三者必须且只能传一个) | 200:`{"ok": true}`<br>错误:400 `每次只能修改一个静态网站配置项`/`静态网站名称必须为 1 至 128 个字符`;403;404;502 `更新静态网站失败: …` | 重命名、改域名、启停,一次一项。注意:`domains` 的格式/保留域名校验失败也走 502 `更新静态网站失败: <原因>`,而非 400。 | 需登录+CSRF写保护 |
+| 删除静态网站 | DELETE | `/api/pages/{siteID}` | 路径参数:`siteID`<br>CSRF体(上限8KiB) | 200:`{"ok": true}`<br>错误:403;404;502 `删除静态网站失败` | 删除 Pages 站点。 | 需登录+CSRF写保护 |
+| 获取协议配置 | GET | `/api/pages/{siteID}/protocols` | 路径参数:`siteID` | 200:SiteProtocols<br>`httpEnabled`/`httpsEnabled`/`http2Enabled`/`http3Enabled`/`alwaysUseHTTPS` bool<br>`certificateIds` int64[] 已启用证书ID<br>`serverNames` string[] 站点精确域名<br>`filterable` bool<br>`certificates` SiteCertificate[](非 CA 证书,按 `timeEndAt` 升序)<br>错误:404;502 `读取站点协议配置失败`/`读取 HTTPS 跳转配置失败`/`读取证书列表失败` | 返回协议开关、已绑定证书及全部可选证书,并带与站点域名的匹配结果。`filterable=false`(无域名或含通配/正则)时前端应展示全部证书。 | 需登录 |
+| 更新协议配置 | PUT | `/api/pages/{siteID}/protocols` | 路径参数:`siteID`<br>JSON 请求体(上限64KiB):<br>`csrfToken` string 必填<br>`httpEnabled` bool<br>`httpsEnabled` bool<br>`http2Enabled` bool<br>`http3Enabled` bool<br>`alwaysUseHTTPS` bool<br>`certificateIds` int64[] ≤20,去重 | 200:`{"ok": true}`<br>错误:400 `HTTP/3 需要同时开启 HTTPS 和 HTTP/2`/`始终使用 HTTPS 需要同时开启 HTTP 和 HTTPS`/`单个站点最多选择 20 张证书`/`包含不可用、已过期或不属于当前用户的证书`/`开启 HTTPS 前请至少选择一张有效证书`;403 `当前套餐未开通HTTP/3功能`、`当前套餐未开通始终使用 HTTPS功能`(格式:`当前套餐未开通<名称>功能`);404;502 `更新站点协议配置失败` | 全量覆盖协议配置。启用 HTTP/3 需套餐含 `UserFeatureCodeServerHTTP3` 功能,启用 `alwaysUseHTTPS` 需含 HTTPS 跳转功能;所选证书必须启用、非 CA、未过期且属于当前用户。 | 需登录+CSRF写保护 |
+| 获取WAF配置 | GET | `/api/pages/{siteID}/waf` | 路径参数:`siteID` | 200:`{"site": PageSite, "waf": WAFConfig}`<br>错误:404 `站点不存在`;403 `当前套餐未开通 WAF 功能`;502 `读取站点失败`/`读取 WAF 配置失败` | 返回站点独立 WAF 配置及可选规则组(入站/出站)。 | 需登录 |
+| 更新WAF配置 | PUT | `/api/pages/{siteID}/waf` | 路径参数:`siteID`<br>JSON 请求体(上限64KiB)= `csrfToken` + WAFConfig 全部字段(见公共结构):<br>`isPrior`、`isOn`、`ignoreGlobalRules`、`defaultCaptcha`、`forceCaptcha`、`mode`、`maxRequestBodySize`、`groups`<br>校验:`mode` 须为有效模式;`defaultCaptcha` 须为有效类型;`forceCaptcha=true` 需 `isOn=true`;`maxRequestBodySize` 0 取默认值,否则 64KiB~16MiB;`groups[].code` 须为模板内已知规则组 | 200:`{"ok": true}`<br>错误:400 `WAF 模式无效`/`默认人机验证方式无效`/`启用强制 CAPTCHA 前请先启用 WAF`/`WAF 请求内容检查上限必须在 64 KiB 至 16 MiB 之间`/`未知的 WAF 规则组: <code>`;403 `当前套餐未开通 WAF 功能`;404;502 `读取 WAF 配置失败`/`更新 WAF 配置失败` | 全量覆盖站点 WAF;首次开启且无策略时按模板创建"Pages WAF"策略;`groups` 中未传入或 `isOn=false` 的模板规则组会被关闭。 | 需登录+CSRF写保护 |
+| 获取访问控制 | GET | `/api/pages/{siteID}/access` | 路径参数:`siteID` | 200:<br>`site` PageSite<br>`access` {`allowIPs` string[],`denyIPs` string[],`allowCountryIds` int64[],`denyCountryIds` int64[]}<br>`countries` [{`id` int64,`name` string,`code` string 大写国家码}]<br>错误:404 `站点不存在`;502 `读取站点失败`/`读取访问控制配置失败` | 返回 IP 黑白名单和国家/地区黑白名单,以及可选国家列表。 | 需登录 |
+| 更新访问控制 | PUT | `/api/pages/{siteID}/access` | 路径参数:`siteID`<br>JSON 请求体(上限64KiB):<br>`csrfToken` string 必填<br>`allowIPs` string[] 每项单个 IP 或 CIDR,≤500,自动规范化去重<br>`denyIPs` string[] 同上<br>`allowCountryIds` int64[] ≤300,>0,须为可选国家<br>`denyCountryIds` int64[] 同上 | 200:`{"ok": true}`<br>错误:400 `允许名单无效: …`/`禁止名单无效: …`(`每个名单最多 500 条`/`请输入单个 IP 或 CIDR`)/`同一地址范围不能同时出现在允许和禁止名单中`/`国家或地区选项过多`/`国家或地区选项无效`/`同一国家或地区不能同时允许和禁止`;403;404;502 `读取国家和地区列表失败`/`更新访问控制配置失败` | 全量覆盖访问控制;允许与禁止名单的 IP 范围、国家均不能重叠(同一IP版本内的包含关系即视为重叠)。 | 需登录+CSRF写保护 |
+| 获取访问验证(UAM) | GET | `/api/pages/{siteID}/uam` | 路径参数:`siteID` | 200:`{"site": PageSite, "uam": UAMConfig}`<br>错误:403 `当前套餐未开通访问验证功能`;404 `站点不存在`;502 `读取站点访问验证配置失败` | 需套餐含 `UserFeatureCodeServerUAM` 功能;无配置时返回默认值(`challengeDifficulty` 18、`challengeTimeout` 120),`isPrior` 恒为 true。 | 需登录;需套餐功能 |
+| 更新访问验证(UAM) | PUT | `/api/pages/{siteID}/uam` | 路径参数:`siteID`<br>JSON 请求体(上限64KiB)= `csrfToken` + UAMConfig 字段:<br>`isOn` bool、`addToWhiteList` bool<br>`minQPSPerIP` int 0~999999<br>`keyLife` int 0~3600<br>`challengeDifficulty` int 14~22(0→18)<br>`challengeTimeout` int 60~180(0→120)<br>`onlyURLPatterns`/`exceptURLPatterns` URLPattern[] ≤100<br>(`isPrior` 字段可传但被忽略,服务端固定 true) | 200:`{"ok": true}`<br>错误:400 `访问验证高级参数无效`/`仅限 URL 规则无效: …`/`排除 URL 规则无效: …`/`访问验证配置无效: …`;403 `当前套餐未开通访问验证功能`;404;502 `更新站点访问验证配置失败` | 全量覆盖 5 秒盾/访问验证配置。 | 需登录+CSRF写保护;需套餐功能 |
+| 获取CC防护 | GET | `/api/pages/{siteID}/cc` | 路径参数:`siteID` | 200:`{"site": PageSite, "cc": CCConfig}`<br>错误:403 `当前套餐未开通CC 防护功能`;404 `站点不存在`;502 `读取站点 CC 防护配置失败` | 需套餐含 `UserFeatureCodeServerCC` 功能;无配置时返回默认配置,`isPrior` 恒为 true。 | 需登录;需套餐功能 |
+| 更新CC防护 | PUT | `/api/pages/{siteID}/cc` | 路径参数:`siteID`<br>JSON 请求体(上限64KiB)= `csrfToken` + CCConfig 字段:<br>`isOn` bool<br>`thresholds` CCThreshold[] 必填 1~10 条<br>`onlyURLPatterns`/`exceptURLPatterns` URLPattern[] ≤100 | 200:`{"ok": true}`<br>错误:400 `CC 阈值数量必须为 1 到 10 条`/`CC 阈值名称不能超过 100 个字符`/`HTTP 方法数量过多`/`HTTP 方法无效: X`/`CC 阈值无效: …`/`启用 CC 防护时至少需要一条已启用阈值`/URL 规则错误/`CC 防护配置无效: …`;403 `当前套餐未开通CC 防护功能`;404;502 `更新站点 CC 防护配置失败` | 全量覆盖 CC 防护;仅 `isOn=true` 的阈值会被初始化校验;整体启用时至少需一条已启用阈值。`methods` 仅允许标准 HTTP 方法(≤16,大写去重)。 | 需登录+CSRF写保护;需套餐功能 |
+| 获取缓存配置 | GET | `/api/pages/{siteID}/cache` | 路径参数:`siteID` | 200:`{"site": PageSite, "cache": CacheConfig}`<br>错误:404 `站点不存在`;502 `读取站点失败`/`读取缓存配置失败` | 返回站点缓存开关与规则;高级缓存规则(无法映射为简单规则的)不在 `rules` 中展示。 | 需登录 |
+| 更新缓存配置 | PUT | `/api/pages/{siteID}/cache` | 路径参数:`siteID`<br>JSON 请求体(上限64KiB)= `csrfToken` + CacheConfig 字段:<br>`isPrior`、`isOn`、`addStatusHeader`、`addAgeHeader`、`enableCacheControlMaxAge`、`useDefaultPolicy`、`purgeIsOn` bool<br>`rules` CacheRule[] ≤50<br>(`purgeKeyConfigured` 可传但被忽略) | 200:`{"ok": true}`<br>错误:400 `缓存规则不能超过 50 条`/`缓存规则索引无效`/`不能修改高级缓存规则`/`缓存最小内容大小不能大于最大内容大小`/`缓存配置无效: …`等规则校验错误;403;404;502 `读取缓存配置失败`/`更新缓存配置失败` | 全量覆盖缓存配置:`sourceIndex≥0` 的规则按原下标修改,`-1`(<0) 视为新增;未在请求中出现的简单规则被删除,高级规则保留不动。待确认:`matchType`、`life`、`status` 等字段的具体枚举/范围(由 `buildCacheCondition`、`validateCacheLife` 等函数校验,本次未逐项读取)。 | 需登录+CSRF写保护 |
+| 创建缓存任务 | POST | `/api/pages/{siteID}/cache/tasks` | 路径参数:`siteID`<br>JSON 请求体(上限256KiB):<br>`csrfToken` string 必填<br>`type` string 必填:`purge`(刷新)/`fetch`(预热)<br>`keyType` string 必填:`key`(完整URL)/`prefix`(前缀);`fetch` 只能用 `key`<br>`keys` string[] 必填,1~1000个,每个 ≤2048 字符,必须是 http/https 完整 URL(不含用户信息),去重 | **201**:`{"id": int64, "count": int64}`(任务ID,有效URL数)<br>错误:400 `缓存任务类型无效`/`缓存任务匹配方式无效`/`缓存预热只能使用完整 URL`/`请至少输入一个 URL`/`单次最多提交 1000 个 URL`/`URL 长度不能超过 2048 个字符`/`URL 无效: …`;403;404 `站点不存在`;422 `没有匹配到当前账户的有效站点 URL`;502 `创建缓存任务失败` | 提交缓存刷新/预热任务;URL 是否属于当前账户由后端 RPC 判定,全不匹配则 422。 | 需登录+CSRF写保护 |
+| 静态文件列表 | GET | `/api/pages/{siteID}/files` | 路径参数:`siteID`<br>查询参数:`directory` string 可选,站点内相对目录,空=根;禁止 `..` 越界与 NUL | 200:<br>`directory` string 规范化后目录<br>`parent` string 上级目录("" 为根)<br>`files` PagesFile[]<br>错误:400 `目录路径无效`;404 `资源不存在`/`静态站点不存在`;502 `读取静态文件失败` | 列出目录内容;文件名不合法的条目被静默跳过。 | 需登录 |
+| 上传静态文件 | POST | `/api/pages/{siteID}/files` | 路径参数:`siteID`<br>请求头:`X-CSRF-Token` 必填<br>查询参数:`directory` string 可选(同上)<br>请求体:`multipart/form-data`,表单字段 `file`(文件);文件名 ≤255,不得含 `/`、`\`、NUL,且不能被路径规范化改变;只处理第一个 `file` 字段 | 201:`{"ok": true, "path": string}`(文件完整相对路径)<br>错误:400 `上传请求格式无效`/`请选择上传文件`/`文件名无效`/`目录路径无效`;403 CSRF;404;413 `上传文件不能超过 512 MiB`;502 `上传静态文件失败` | 流式上传单个文件到站点存储,超时 10 分钟,体积上限 512MiB(`maximumUploadBytes`)。同名文件的覆盖行为待确认:由 RPC 层决定。 | 需登录+CSRF写保护(CSRF 在请求头) |
+| 删除静态文件 | DELETE | `/api/pages/{siteID}/files` | 路径参数:`siteID`<br>JSON 请求体(上限16KiB):<br>`csrfToken` string 必填<br>`filename` string 必填,站点内相对路径,不能为空 | 200:`{"ok": true, "purgeQueued": bool}`(缓存清理任务是否已提交)<br>错误:400 `文件路径无效`;403;404;502 `删除静态文件失败` | 删除文件后自动对其所在目录发起缓存清理;清理失败不影响删除结果,仅 `purgeQueued=false`。 | 需登录+CSRF写保护 |
+| 清理缓存(按目录) | POST | `/api/pages/{siteID}/purge` | 路径参数:`siteID`<br>JSON 请求体(上限16KiB):<br>`csrfToken` string 必填<br>`directory` string 可选,空=整站 | **202**:`{"ok": true}`<br>错误:400 `目录路径无效`;403;404;502 `创建缓存清理任务失败` | 对站点全部域名的指定目录创建缓存清理任务(异步)。与"创建缓存任务"不同,这里按目录而非 URL 列表。 | 需登录+CSRF写保护 |
+
+## 公共结构
+
+CSRF体:`{"csrfToken": string}`。
+
+PagesConfig:`available` bool(服务已启用且配置了存储)、`projectsPerLimit` int64(每用户站点数上限)、`storageLimitMB` int64(每站点存储上限)、`defaultPage` string、`default404Page` string、`maximumUploadBytes` int64(固定 536870912)。配置读取为空时仅返回 `maximumUploadBytes`。
+
+PageSite:`id` string(公开引用)、`name`、`domain`(首个绑定域名,依次回落到 ServerNames 首项、站点名)、`isOn` bool、`dnsName` string(集群 CNAME 接入域名,空省略)、`createdAt` int64(0 省略)。不含源站、集群、站点组信息。
+
+PagesDNS:`recordType`(`CNAME` 或 `A/AAAA`)、`host`、`target`(空省略)、`resolved` bool、`addresses` string[]、`message` string(解析状态提示,如"域名尚未解析,请添加 CNAME 记录后等待 DNS 生效")。含通配符域名时不做检查,`message` 提示先绑定非通配域名。
+
+SiteCertificate:Certificate 全部字段(`id`、`isOn`、`name`、`description`、`serverName`、`isCA`、`isACME`、`timeBeginAt`、`timeEndAt`、`dnsNames`、`commonNames`、`ocspExpiresAt`、`ocspError`,字段含义同 user-08 的 Certificate)+ `matchesSite` bool、`matchedNames` string[]。
+
+WAFConfig:`isPrior` bool、`isOn` bool、`ignoreGlobalRules` bool、`defaultCaptcha` string、`forceCaptcha` bool、`mode` string、`maxRequestBodySize` int64(字节)、`groups` WAFRuleGroup[]。待确认:`mode`(防御/观察/绕过三值)与 `defaultCaptcha`(none/default 两值)的字面量由 `firewallconfigs` 常量定义,本次未读取。
+WAFRuleGroup:`code` string、`name`、`description`、`direction`(`inbound`/`outbound`)、`isOn` bool。
+
+URLPattern:`type` string(wildcard/regexp/images/audios/videos 五类,字面量由 `shared.URLPatternType*` 常量定义,待确认)、`pattern` string(wildcard/regexp 必填且 ≤2000 字符,其余类型忽略)。
+
+UAMConfig:`isPrior`、`isOn`、`addToWhiteList` bool,`minQPSPerIP`、`keyLife`、`challengeDifficulty`、`challengeTimeout` int,`onlyURLPatterns`、`exceptURLPatterns` URLPattern[]。
+
+CCConfig:`isPrior`、`isOn` bool,`thresholds` CCThreshold[],`onlyURLPatterns`、`exceptURLPatterns` URLPattern[]。
+CCThreshold:`name` string(≤100)、`isOn` bool、`path` string(可选)、`conditions` object(可选,HTTPCCConditions)、`groupBy` string(可选)、`priority` int(可选)、`periodSeconds` int、`maxRequests` int、`blockSeconds` int、`statusCode` int、`perURI` bool、`methods` string[]。待确认:各数值字段的范围由 `threshold.Init()` 校验,本次未读取。
+
+CacheConfig:`isPrior`、`isOn`、`addStatusHeader`、`addAgeHeader`、`enableCacheControlMaxAge`、`useDefaultPolicy`、`purgeIsOn`、`purgeKeyConfigured`(仅响应有意义)bool,`rules` CacheRule[]。
+CacheRule:`sourceIndex` int(原规则下标,新增传负数)、`isOn`、`isReverse`、`matchType` string(含 `extension` 等)、`values` string[]、`isCaseInsensitive` bool、`life` {`count` int64,`unit` string}、`ignoreQuery` bool、`status` int[]、`minSize`/`maxSize` {`count` int64,`unit` string}、`skipCacheControlValues` string[]、`skipSetCookie`、`enableRequestCachePragma`、`allowChunkedEncoding`、`allowPartialContent`、`forcePartialContent`、`alwaysForwardRangeRequest`、`enableIfNoneMatch`、`enableIfModifiedSince`、`enableReadingOriginAsync` bool。
+
+PagesFile:`name`、`path`(含目录的完整相对路径)、`size` int64、`isDirectory` bool、`createdAt` int64(Unix秒,0 省略)。
